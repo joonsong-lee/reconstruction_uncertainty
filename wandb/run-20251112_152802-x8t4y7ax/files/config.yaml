@@ -1,0 +1,101 @@
+_wandb:
+    value:
+        cli_version: 0.22.2
+        e:
+            ctucba1gyve3y9qsafqhwzp3fl2ep38b:
+                codePath: train_partner_with_collect_ovc.py
+                codePathLocal: train_partner_with_collect_ovc.py
+                cpu_count: 32
+                cpu_count_logical: 64
+                cudaVersion: "12.2"
+                disk:
+                    /:
+                        total: "1935030018048"
+                        used: "87440740352"
+                email: ytytjkh@gmail.com
+                executable: /home/ljsong7/.conda/envs/rc/bin/python
+                gpu: NVIDIA GeForce RTX 3090
+                gpu_count: 4
+                gpu_nvidia:
+                    - architecture: Ampere
+                      cudaCores: 10496
+                      memoryTotal: "25769803776"
+                      name: NVIDIA GeForce RTX 3090
+                      uuid: GPU-879d22ba-2a36-05a2-79ec-ee9a7701bf32
+                    - architecture: Ampere
+                      cudaCores: 10496
+                      memoryTotal: "25769803776"
+                      name: NVIDIA GeForce RTX 3090
+                      uuid: GPU-aa23f8b2-674c-0f6d-ced5-68acfe17d1a1
+                    - architecture: Ampere
+                      cudaCores: 10496
+                      memoryTotal: "25769803776"
+                      name: NVIDIA GeForce RTX 3090
+                      uuid: GPU-b2f93a96-6262-e570-1575-e8ee3a6e47ae
+                    - architecture: Ampere
+                      cudaCores: 10496
+                      memoryTotal: "25769803776"
+                      name: NVIDIA GeForce RTX 3090
+                      uuid: GPU-b46dda18-cd6a-eed7-9493-fb7b16e3a329
+                host: unistml7
+                memory:
+                    total: "270084009984"
+                os: Linux-5.4.0-216-generic-x86_64-with-glibc2.31
+                program: /mnt/home/ljsong7/recon_cu/reconstruction_curiousity/train_partner_with_collect_ovc.py
+                python: CPython 3.10.12
+                root: /mnt/home/ljsong7/recon_cu/reconstruction_curiousity
+                startedAt: "2025-11-12T06:28:02.189391Z"
+                writerId: ctucba1gyve3y9qsafqhwzp3fl2ep38b
+        m: []
+        python_version: 3.10.12
+        t:
+            "1":
+                - 1
+                - 12
+                - 45
+            "2":
+                - 1
+                - 12
+                - 45
+            "3":
+                - 2
+                - 16
+                - 61
+            "4": 3.10.12
+            "5": 0.22.2
+            "12": 0.22.2
+            "13": linux-x86_64
+log_interval:
+    value: 1
+params:
+    value:
+        algorithm:
+            action_dim: 6
+            latent_dim: 400
+            lstm_dim: 256
+        base_seed: 0
+        loss:
+            entropy_weight: 0.02
+            gamma: 0.99
+            lambda_: 0.95
+        max_episode_length: 400
+        max_grad_norm: 1
+        num_iterations: 2500
+        num_workers: 24
+        optimizer:
+            betas:
+                - 0.99
+                - 0.99
+            eps: 1e-06
+            lr: 0.0001
+            weight_decay: 0.1
+        save_interval: 200
+path:
+    value:
+        ckpt_path: ./out/ovc_0/best_model.pt
+        out_dir: ./out/ovc_0/
+        save_dir: ../datas/ovc
+wandb:
+    value:
+        entity: junesong
+        project: ovc

@@ -1,0 +1,31 @@
+partners:
+  log_interval: 1
+  params:
+    num_workers: 48
+    base_seed: 0
+    algorithm:
+    #latent_dim,lstm_dim,action_dim
+      latent_dim: 71
+      action_dim : 4  
+      lstm_dim: 256
+    loss:
+      entropy_weight: 0.02
+      gamma: 0.99
+      lambda_: 0.95
+    optimizer:
+      lr: 0.0001
+      weight_decay: 0.1
+      betas: [0.99,0.99]
+      eps : 1.0e-6
+      #actor_weight : 0.1
+    max_grad_norm: 1.0
+    max_episode_length: 500
+    num_iterations: 4000 
+    save_interval: 200
+  path:
+    ckpt_path: null
+    out_dir: ./out/partner_0/
+    save_dir: ../datas/
+  wandb:
+    entity: junesong
+    project: rware

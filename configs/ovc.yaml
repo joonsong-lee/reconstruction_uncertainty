@@ -1,0 +1,153 @@
+partners:
+  log_interval: 1
+  params:
+    num_workers: 24
+    base_seed: 1500000
+    algorithm:
+    #latent_dim,lstm_dim,action_dim
+      latent_dim: 400
+      action_dim : 6
+      lstm_dim: 256
+    loss:
+      entropy_weight: 0.02
+      gamma: 0.99
+      lambda_: 0.95
+    optimizer:
+      lr: 0.0001
+      weight_decay: 0.1
+      betas: [0.99,0.99]
+      eps : 1.0e-6
+      #actor_weight : 0.1
+    max_grad_norm: 1.0
+    max_episode_length: 400
+    num_iterations: 2500
+    save_interval: 200
+  path:
+    ckpt_path: null
+    out_dir: ./out/ovc_15/
+    save_dir: null #../datas/ovc
+  wandb:
+    entity: junesong
+    project: ovc
+
+recon_module:
+  log_interval: 100
+  save_interval: 10
+  eval_every: 1000
+  eval_step: 20
+  early_stop: 20
+
+  params:
+    batch_size: 16
+    num_worker: 8
+    epochs: 200
+    decay_lr: true
+    grad_clip: 1.0
+    
+    model:
+      in_features: 512
+      out_units: 2200
+      num_classes: 20
+      gpt_config:
+        input_size: 950
+        batch_size: ${recon_module.params.batch_size}
+        frame_length: 400
+        n_layer: 4
+        n_head: 16 #in features // n head should be even for rope
+        n_embd: ${recon_module.params.model.in_features}
+        dropout: 0.0
+        bias: true
+
+    optimizer:
+      betas: [0.9,0.95]
+      lr: 1.0e-05
+      weight_decay: 0.1
+      eps: 1.0e-6
+    
+    scheduler:
+      lr_decay_iters: 200000
+      min_lr: 3.0e-05
+      warmup_iters: 5000
+      wm_learning_rate: ${recon_module.params.optimizer.lr}
+
+    dataset:
+      data_dir: ${recon_module.path.data_dir}
+      
+  path:
+    ckpt_path: ./out/ovc_recon_classification2/best_model.pt
+    data_dir: ../datas/ovc
+    out_dir: ./out/ovc_recon_classification_noev
+  wandb:
+    entity: ${partners.wandb.entity}
+    project: ${partners.wandb.project}_recon
+
+
+fcp:
+  log_interval: 1
+  params:
+    batch_size: 24
+    num_partners: 12
+    base_seed: 1500000
+    algorithm:
+    #latent_dim,lstm_dim,action_dim
+      latent_dim: 400
+      action_dim : 6
+      lstm_dim: 256
+    loss:
+      entropy_weight: 0.02
+      gamma: 0.99
+      lambda_: 0.95
+    optimizer:
+      lr: 0.0001
+      weight_decay: 0.1
+      betas: [0.99,0.99]
+      eps : 1.0e-6
+      #actor_weight : 0.1
+    max_grad_norm: 1.0
+    max_episode_length: 400
+    num_iterations: 25000
+    save_interval: 200
+  path:
+    ckpt_path: ./out/ovc_fcp/best_model.pt
+    partner_dir: ./out
+    out_dir: ./out/ovc_fcp
+  wandb:
+    entity: junesong
+    project: ovc
+
+fcp_recon:
+  log_interval: 5
+  params:
+    buffer_size: 2000
+    batch_size: 16
+    added_dim: 2
+    num_partners: 12
+    base_seed: 1500000
+    algorithm:
+    #latent_dim,lstm_dim,action_dim
+      latent_dim: 440
+      added_dim: ${fcp_recon.params.added_dim}
+      action_dim : 6
+      lstm_dim: 256
+    loss:
+      entropy_weight: 0.02
+      gamma: 0.99
+      lambda_: 0.95
+    optimizer:
+      lr: 0.0001
+      weight_decay: 0.1
+      betas: [0.99,0.99]
+      eps : 1.0e-6
+      #actor_weight : 0.1
+    max_grad_norm: 1.0
+    max_episode_length: 400
+    num_iterations: 50000
+    save_interval: 200
+  path:
+    ckpt_path: ./out/ovc_1/best_model.pt
+    recon_ckpt_path: ./out/ovc_fcp_recon_learning2/best_recon_model.pt
+    partner_dir: ./out
+    out_dir: ./out/ovc_fcp_recon_learning2
+  wandb:
+    entity: junesong
+    project: ovc

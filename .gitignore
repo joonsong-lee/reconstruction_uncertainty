@@ -1,0 +1,10 @@
+# Ignore everything
+*
+
+# But do not ignore directories, allows to check the content inside them
+!*/
+
+# Do not ignore Python script and sh files
+!*.py
+!.gitignore
+!*.yaml
