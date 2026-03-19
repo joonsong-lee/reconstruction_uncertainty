@@ -8,4 +8,5 @@
 !*.py
 !.gitignore
 !*.yaml
+!*.md
 wandb/*
