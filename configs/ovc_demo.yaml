@@ -1,0 +1,215 @@
+partners:
+  env:
+    grid: 'demo_cook_simple'
+    agent_view_size: 2
+    random_agent_positions: true
+    negative_rewards: true
+    sample_recipe_on_delivery: true
+  log_interval: 50
+  params:
+    batch_size: 128
+    swp_psn: false
+    early_stop: 500
+    model:
+      conv_layers: [[38,32,1],[32,16,1],[16,8,1],[8,16,3],[16,32,3],[32,16,3]]
+      latent_dim: 400
+      action_dim : 6  
+      lstm_dim: 256
+
+    algorithm:
+      clip: 0.1
+      num_minibatch: 2
+      num_epochs: 10
+    loss:
+      entropy_weight: 0.1
+      gamma: 0.985
+      lambda_: 0.95
+      value_coef: 0.5
+    optimizer:
+      learning_rate: 0.0001
+      weight_decay: 0.1
+      b1: 0.99
+      b2: 0.99
+      eps : 1.0e-6
+      #actor_weight : 0.1
+    max_grad_norm: 1.0
+    max_episode_length: 400
+    num_iterations: 50
+    save_interval: 100
+    reward_shaping_iters: 15000
+  path:
+    ckpt_path: ./alg/out/ovc_demo/partners/best_model_7000
+    out_dir: ./alg/out/ovc_demo/partners
+    save_dir: ../datas/ovc_demo
+  wandb:
+    entity: junesong
+    project: overcooked_renew_jax
+
+recon_module:
+  log_interval: 100
+  save_interval: 10
+  eval_every: 1000
+  eval_step: 20
+  early_stop: 20
+
+  params:
+    batch_size: 16
+    num_worker: 8
+    epochs: 200
+    decay_lr: true
+    grad_clip: 1.0
+    
+    model:
+      in_features: 512
+      out_units: 2200
+      num_classes: 20
+      gpt_config:
+        input_size: 950
+        batch_size: ${recon_module.params.batch_size}
+        frame_length: 400
+        n_layer: 4
+        n_head: 16 #in features // n head should be even for rope
+        n_embd: ${recon_module.params.model.in_features}
+        dropout: 0.0
+        bias: true
+
+    optimizer:
+      betas: [0.9,0.95]
+      lr: 1.0e-04
+      weight_decay: 0.1
+      eps: 1.0e-6
+    
+    scheduler:
+      lr_decay_iters: 400000
+      min_lr: 1.0e-05
+      warmup_iters: 10000
+      wm_learning_rate: ${recon_module.params.optimizer.lr}
+
+    dataset:
+      data_dir: ${recon_module.path.data_dir}
+      
+  path:
+    ckpt_path: ./out/ovc_recon_classification_demo/checkpoints/best_model
+    data_dir: ../datas/ovc_demo
+    out_dir: ./out/ovc_recon_classification_demo
+  wandb:
+    entity: ${partners.wandb.entity}
+    project: ${partners.wandb.project}_recon
+
+
+fcp:
+  log_interval: 1
+  params:
+    batch_size: 32
+    num_partners: 8
+    base_seed: 1500000
+    
+    model:
+      # conv_layers: [[in_ch, out_ch, kernel_size], ...]
+      # Input: local observation (C=38 channels for agent_view_size=2)
+      conv_layers: [[38,32,1],[32,16,1],[16,8,1],[8,16,3],[16,32,3],[32,16,3]]
+      latent_dim: 400
+      action_dim: 6
+      lstm_dim: 256
+    
+    loss:
+      entropy_weight: 0.02
+      gamma: 0.99
+      lambda_: 0.95
+    optimizer:
+      learning_rate: 0.0001
+      weight_decay: 0.1
+      b1: 0.99
+      b2: 0.99
+      eps : 1.0e-6
+    max_grad_norm: 1.0
+    max_episode_length: 400
+    num_iterations: 25000
+    save_interval: 200
+  path:
+    ckpt_path: /home/ljsong7/rc/reconstruction_uncertainty/out/ovc_demo_fcp
+    partner_dir: ./alg/out/ovc_demo/partners
+    out_dir: ./out/ovc_demo_fcp
+  wandb:
+    entity: junesong
+    project: ovc_demo_fcp
+
+fcp_recon:
+  log_interval: 5
+  params:
+    buffer_size: 2000
+    batch_size: 32
+    num_partners: 8
+    base_seed: 1500000
+    
+    model:
+      # conv_layers: [[in_ch, out_ch, kernel_size], ...]
+      # Input: recon_obs (C=40) + epistemic_unc (1) + aleatoric_unc (1) = 42 channels
+      conv_layers: [[42,32,1],[32,16,1],[16,8,1],[8,16,3],[16,32,3],[32,16,3]]
+      latent_dim: 880
+      action_dim: 6
+      lstm_dim: 256
+    
+    loss:
+      entropy_weight: 0.02
+      gamma: 0.99
+      lambda_: 0.95
+    optimizer:
+      learning_rate: 0.0001
+      weight_decay: 0.1
+      b1: 0.99
+      b2: 0.99
+      eps : 1.0e-6
+    max_grad_norm: 1.0
+    max_episode_length: 400
+    num_iterations: 50000
+    save_interval: 200
+  path:
+    ckpt_path: /home/ljsong7/rc/reconstruction_uncertainty/out/ovc_demo_fcp_recon/model_iter_4999
+    recon_ckpt_path: /home/ljsong7/rc/reconstruction_uncertainty/out/ovc_demo_fcp_recon/recon_model_iter_4999
+    partner_dir: ./alg/out/ovc_demo/partners
+    out_dir: ./out/ovc_demo_fcp_recon
+  wandb:
+    entity: junesong
+    project: ovc_demo_fcp_recon
+
+fcp_recon_local:
+  log_interval: 5
+  params:
+    buffer_size: 2000
+    batch_size: 32
+    num_partners: 8
+    base_seed: 1500000
+    
+    model:
+      # conv_layers for recon_obs: recon (C=40) + epistemic (1) + aleatoric (1) = 42 channels
+      conv_layers: [[42,32,1],[32,16,1],[16,8,1],[8,16,3],[16,32,3],[32,16,3]]
+      latent_dim: 880
+      # conv_layers2 for local_obs: local observation (C=38 for agent_view_size=2)
+      conv_layers2: [[38,32,1],[32,16,1],[16,8,1],[8,16,3],[16,32,3],[32,16,3]]
+      latent_dim2: 400
+      action_dim: 6
+      lstm_dim: 256
+    
+    loss:
+      entropy_weight: 0.02
+      gamma: 0.99
+      lambda_: 0.95
+    optimizer:
+      learning_rate: 0.0001
+      weight_decay: 0.1
+      b1: 0.99
+      b2: 0.99
+      eps : 1.0e-6
+    max_grad_norm: 1.0
+    max_episode_length: 400
+    num_iterations: 50000
+    save_interval: 200
+  path:
+    ckpt_path: /home/ljsong7/rc/reconstruction_uncertainty/out/ovc_demo_fcp_recon_local/model_iter_6999
+    recon_ckpt_path: /home/ljsong7/rc/reconstruction_uncertainty/out/ovc_demo_fcp_recon_local/recon_model_iter_6999
+    partner_dir: ./alg/out/ovc_demo/partners
+    out_dir: ./out/ovc_demo_fcp_recon_local
+  wandb:
+    entity: junesong
+    project: ovc_demo_fcp_recon_local

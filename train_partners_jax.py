@@ -8,7 +8,7 @@ import jax
 
 jax.config.update("jax_default_matmul_precision", "tensorfloat32")
 import jax.numpy as jnp
-import jaxmarl
+from jaxmarl.environments.overcooked_v2.overcooked import OvercookedV2
 from jaxmarl.environments import overcooked_v2_layouts
 from jaxmarl.environments.overcooked_v2.layouts import Layout
 import flax.nnx as nnx
@@ -17,9 +17,8 @@ import optax
 from orbax import checkpoint as ocp
 #os.environ['CUDA_VISIBLE_DEVICES'] = '1,2'
 from argparse import ArgumentParser
-from functools import partial
+
 import numpy as np
-from tqdm import tqdm
 import wandb
 from omegaconf import OmegaConf
 
@@ -47,8 +46,9 @@ def unbatchify(x: jnp.ndarray, agent_list, num_envs, num_actors):
     return {a: x[i] for i, a in enumerate(agent_list)}
 
 def make_train(config):
-    layout = config['env'] if config['env']['grid'] in overcooked_v2_layouts.keys() else Layout.from_string(config['env']['grid'],config['env']['possible_recipes'])
-    env = jaxmarl.make(layout, None, config['params']['max_episode_length'])
+    layout = config['env']['grid'] if config['env']['grid'] in overcooked_v2_layouts.keys() else Layout.from_string(config['env']['grid'],config['env']['possible_recipes'])
+    config['env'].pop('grid')
+    env = OvercookedV2(layout=layout, **config['env'])
 
     rew_shaping_anneal = optax.linear_schedule(
         init_value=1.0, end_value=0.0, transition_steps=config["params"]["reward_shaping_iters"]
@@ -73,31 +73,32 @@ def make_train(config):
         #     other_variables=other_variables,
         #     tx=tx
         #     )
-        optimizer = nnx.Optimizer(network,tx)
+        optimizer = nnx.Optimizer(network,tx,wrt=nnx.Param)
         # INIT ENV
         
         initial_hstate = ScannedRNN.initialize_carry(
             config['params']['batch_size']*2, config['params']['model']['lstm_dim']
         )
-        checkpointer = ocp.AsyncCheckpointer()
+        checkpointer = ocp.AsyncCheckpointer(ocp.StandardCheckpointHandler())
         iter_manager = ocp.CheckpointManager(
             os.path.abspath(os.path.join(config['path']['out_dir'],f'iter_saver_{base_num}')), checkpointer, ocp.CheckpointManagerOptions(max_to_keep=2, create=True))
         best_manager = ocp.CheckpointManager(
             os.path.abspath(os.path.join(config['path']['out_dir'],f'best_model_{base_num}')), checkpointer, ocp.CheckpointManagerOptions(max_to_keep=2, create=True))
         
         # TRAIN LOOP
-        def callback(model_state,opt_state,manager,metric,obs,current_iter):
+        def callback(model_state,opt_state,manager,metric,current_iter):
             ckpt = {'model':model_state.to_pure_dict(),'optimizer':opt_state.to_pure_dict(),'iter':current_iter}
             wandb_metric = {
                         k: v.item() for k, v in metric.items()
                     }
             manager.save(current_iter,args=ocp.args.StandardSave(ckpt))
             wandb.log(wandb_metric, step=current_iter)
-            make_movie(obs, os.path.join(config['path']['save_dir'], f'partner_episode_{base_num}_iter_{current_iter}.gif'))
-        def _update_step(step_state, unused):
+            #make_movie(obs, os.path.join(config['path']['out_dir'], f'partner_episode_{base_num}_iter_{current_iter}.gif'))
+
+        def _update_step(carry, unused):
             # COLLECT TRAJECTORIES
-            initial_hstate, rng,step,best_return = step_state
-            def _env_step(runner_state, unused):
+            network, optimizer, initial_hstate, rng, step, best_return = carry
+            def _env_step(network,runner_state, unused):
                 (
                     env_state,
                     last_obs,
@@ -130,19 +131,17 @@ def make_train(config):
 
                 anneal_factor = rew_shaping_anneal(step)
                 shaped_reward = info['shaped_reward']['agent_0']+info['shaped_reward']['agent_1']
-                combined_reward = reward['agent_0'] + anneal_factor * shaped_reward
-                saving_reward = (reward['agent_0']+ info['shaped_reward']['agent_0'])*10 + info['shaped_reward']['agent_1']
-
+                reward = jax.tree_util.tree_map(
+                    lambda x, y: x + y * anneal_factor, reward, info["shaped_reward"]
+                )
                 info["shaped_reward"] = shaped_reward
-                info["combined_reward"] = combined_reward
-                info['saving_reward'] = saving_reward
                 info['original_reward'] = reward['agent_0']
                 transition = Transition(
                     action.squeeze(),
                     value.squeeze(),
-                    combined_reward.squeeze(),
+                    batchify(reward,env.agents,config['params']['batch_size']*2).squeeze(),
                     log_prob.squeeze(),
-                    last_obs,
+                    obs_batch,
                     info,
                 )
                 runner_state = (
@@ -162,17 +161,18 @@ def make_train(config):
                 initial_obsv,
                 initial_hstate,
                 rng,
+                step,
             )
-            runner_state, traj_batch = nnx.scan(_env_step,length = config['params']['max_episode_length'])(runner_state, None) #T,B,H,W,C
+            runner_state, traj_batch = nnx.scan(_env_step,in_axes=(None,nnx.Carry,None),out_axes=(nnx.Carry,0),length = config['params']['max_episode_length'])(network,runner_state, None) #T,B,H,W,C
 
             # compute last value for gae
-            env_state, last_obs, hstate, rng, step = (
+            env_state, last_obs, hstate, rng, step= (
                 runner_state
             )
             obs_batch = jnp.stack([last_obs[a] for a in env.agents]).reshape(
                     -1, *env.observation_space().shape
                 )
-            _, _, last_val = network(hstate, obs_batch)
+            _, _, last_val = network(hstate, obs_batch[np.newaxis,:])
             last_val = last_val.squeeze()
 
             def _calculate_gae(traj_batch, last_val):
@@ -200,8 +200,10 @@ def make_train(config):
 
             advantages, targets = _calculate_gae(traj_batch, last_val)
             # UPDATE NETWORK
-            def _update_epoch(update_state, unused):
-                def _update_minbatch(_, batch_info):
+            def _update_epoch(carry, unused):
+                network, optimizer, update_state = carry
+                def _update_minbatch(carry, batch_info):
+                    network, optimizer, dummy_carry = carry
                     init_hstate, traj_batch, advantages, targets = batch_info
 
                     def _loss_fn(network,init_hstate, traj_batch, gae, targets):
@@ -247,24 +249,24 @@ def make_train(config):
 
                     grad_fn = nnx.value_and_grad(_loss_fn, has_aux=True)
                     total_loss, grads = grad_fn(
-                         network,init_hstate, traj_batch, advantages, targets
+                         network, init_hstate, traj_batch, advantages, targets
                     )
-                    optimizer.update(network,grads)
-                    return _, total_loss
+                    optimizer.update(network, grads)
+                    return (network, optimizer, dummy_carry), total_loss
 
                 init_hstate, traj_batch, advantages, targets, rng = (
                     update_state
                 )
                 rng, _rng = jax.random.split(rng)
 
-                init_hstate = jax.tree_util.tree_map(lambda x: jnp.reshape(x, (1, config['params']["batch_size"], -1)), init_hstate)
+                init_hstate = jax.tree_util.tree_map(lambda x: jnp.reshape(x, (1, config['params']["batch_size"]*2, -1)), init_hstate)
                 batch = (
                     init_hstate,
                     traj_batch,
                     advantages.squeeze(),
                     targets.squeeze(),
                 )
-                permutation = jax.random.permutation(_rng, config['params']["batch_size"])
+                permutation = jax.random.permutation(_rng, config['params']["batch_size"]*2)
 
                 shuffled_batch = jax.tree_util.tree_map(
                     lambda x: jnp.take(x, permutation, axis=1), batch
@@ -282,8 +284,7 @@ def make_train(config):
                     ),
                     shuffled_batch,
                 )
-                dummy = jnp.zeros((1,))
-                dummy, total_loss = nnx.scan(_update_minbatch)(dummy, minibatches)
+                _,total_loss = nnx.scan(_update_minbatch,in_axes=(nnx.Carry,0),out_axes=(nnx.Carry,0))((network,optimizer,jnp.zeros((1,))), minibatches)
                 update_state = (
                     jax.tree_util.tree_map(lambda x: x.squeeze(), init_hstate),
                     traj_batch,
@@ -291,7 +292,7 @@ def make_train(config):
                     targets,
                     rng,
                 )
-                return update_state, total_loss
+                return (network, optimizer, update_state), total_loss
 
             update_state = (
                 initial_hstate,
@@ -300,33 +301,31 @@ def make_train(config):
                 targets,
                 rng,
             )
-            update_state, loss_info = nnx.scan(_update_epoch,config['params']['algorithm']['num_epochs']) (update_state, None)
+            (network, optimizer, update_state), loss_info = nnx.scan(_update_epoch,length=config['params']['algorithm']['num_epochs'],in_axes=(nnx.Carry,None),out_axes=(nnx.Carry,0))((network,optimizer,update_state), None)
             def _trigger_callback_iter():
                 metric = {
                     'partner_return': jnp.sum(traj_batch.info['original_reward'].squeeze(),axis=0).mean(),
                     'partner_shaped_return': jnp.sum(traj_batch.info['shaped_reward'].squeeze(),axis=0).mean(),
-                    'partner_entropy': loss_info[-1][-1],
+                    'partner_entropy': loss_info[-1][-1].mean(),
                 }
                 jax.debug.callback(callback,
                                    nnx.state(network),
                                    nnx.state(optimizer),
                                    iter_manager,
                                    metric,
-                                   traj_batch.obs[:,-1],
                                    step,
                                    )
             def _trigger_callback_best():
                 metric = {
                     'best_partner_return': jnp.sum(traj_batch.info['original_reward'].squeeze(),axis=0).mean(),
                     'best_partner_shaped_return': jnp.sum(traj_batch.info['shaped_reward'].squeeze(),axis=0).mean(),
-                    'best_partner_entropy': loss_info[-1][-1],
+                    'best_partner_entropy': loss_info[-1][-1].mean(),
                 }
                 jax.debug.callback(callback,
                                    nnx.state(network),
                                    nnx.state(optimizer),
                                    best_manager,
                                    metric,
-                                   traj_batch.obs[:,-1],
                                    step,
                                    )
             jax.lax.cond(step % config['params']['save_interval'] == 0,
@@ -337,12 +336,24 @@ def make_train(config):
                             lambda : None,)
             current_step = step + 1
             best_return = jnp.maximum(jnp.sum(traj_batch.info['original_reward'].squeeze(),axis=0).mean(),best_return)
-            step_state = (initial_hstate, rng,current_step,best_return)
-
-            return step_state,None
-        jit_step = nnx.jit(_update_step)
-        initial_carry = (initial_hstate, rng,jnp.array([0],dtype=jnp.int32),jnp.array([-1e9]))
-        nnx.scan(jit_step,length = config['params']['num_iteration'])(initial_carry, None)
+            carry = (network, optimizer, initial_hstate, rng, current_step, best_return)
+            return carry, None
+        
+        # network와 optimizer를 carry에 포함시켜 nnx.scan 사용
+        initial_carry = (network, optimizer, initial_hstate, rng, jnp.array(0, dtype=jnp.int32), jnp.array(-1e9))
+        
+        # nnx.jit으로 전체 scan을 감싸서 최적화
+        @nnx.jit
+        def run_training(carry, xs):
+            return nnx.scan(
+                _update_step,
+                in_axes=(nnx.Carry, None),
+                out_axes=(nnx.Carry, 0),
+                length=config['params']['num_iterations']
+            )(carry, xs)
+        
+        final_carry, _ = run_training(initial_carry, None)
+        
         return None
 
     return train
@@ -350,7 +361,7 @@ def make_train(config):
 def main(args):
     # LOAD CONFIG
     config = OmegaConf.load(f'./configs/{args.env}.yaml')
-    config = config.partner
+    config = config.partners
     config = OmegaConf.to_container(config, resolve=True)
     os.makedirs(config['path']['out_dir'], exist_ok=True)
     # INIT WANDB

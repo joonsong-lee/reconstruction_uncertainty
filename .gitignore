@@ -8,3 +8,4 @@
 !*.py
 !.gitignore
 !*.yaml
+wandb/*

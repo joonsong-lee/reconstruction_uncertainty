@@ -23,16 +23,16 @@ class ScannedRNN(nnx.Module):
             rngs=rngs
         )
 
-    def __call__(self, x, carry):
+    def __call__(self, carry,x):
  
         def step_fn(carry, x_step):
-            new_carry, y = self.cell(x_step, carry)
+            new_carry, y = self.cell(carry,x_step)
             return new_carry, y
 
         scan = nnx.scan(
             step_fn,
-            in_axes=0,
-            out_axes=0
+            in_axes=(nnx.Carry,0),
+            out_axes=(nnx.Carry,0)
         )
 
         final_carry, out = scan(carry, x)
@@ -49,7 +49,7 @@ class CNN(nnx.Module):
         self.lstm_dim = lstm_dim
         self.activation = activation
         self.depth = len(conv_layers)
-        self.convs = []
+        self.convs = nnx.List([])
         for i, (in_features,out_features, kernel_size) in enumerate(conv_layers):
             self.convs.append(nnx.Conv(
                 in_features=in_features,
@@ -59,15 +59,15 @@ class CNN(nnx.Module):
                 kernel_init=orthogonal(jnp.sqrt(2)),
                 bias_init=constant(0.0),
                 rngs=rngs,
-                name=f"conv_{i}"
             ))
-        self.dense_out = nnx.Linear(latent_dim,lstm_dim,rngs = rngs,name="dense_out")
+        self.dense_out = nnx.Linear(latent_dim,lstm_dim,rngs = rngs)
 
     def __call__(self, x):
 
         for i in range(self.depth):
             x = self.convs[i](x)
             x = self.activation(x)
+        
         x = x.reshape((x.shape[0], -1))
 
         # Dense
@@ -104,13 +104,13 @@ class ActorCriticRNN(nnx.Module):
             rngs=rngs,
         )
         self.action_dim = action_dim
-
+        self.layer_norm = nnx.LayerNorm(lstm_dim,rngs=rngs)
         self.rngs = rngs
 
     def __call__(self, hidden, x):
         embedding = nnx.vmap(self.cnn)(x)
 
-        embedding = nnx.LayerNorm()(embedding)
+        embedding = self.layer_norm(embedding)
 
         rnn_in = (embedding)
         hidden, embedding = self.rnn(hidden, rnn_in)
@@ -123,6 +123,67 @@ class ActorCriticRNN(nnx.Module):
         critic = self.critic(embedding)
 
         return hidden, pi, jnp.squeeze(critic, axis=-1)
+
+
+class ActorCriticRNN_combine(nnx.Module):
+    def __init__(self,conv_layers: list,conv_layers2:list, action_dim: int, latent_dim: int,latent_dim2:int, lstm_dim: int,rngs:nnx.Rngs):
+        self.cnn = CNN(
+            conv_layers=conv_layers,
+            latent_dim=latent_dim,
+            lstm_dim=lstm_dim,
+            rngs=rngs,
+            activation=nn.tanh,
+        )
+        self.cnn2 = CNN(
+            conv_layers=conv_layers2,
+            latent_dim=latent_dim2,
+            lstm_dim=lstm_dim,
+            rngs=rngs,
+            activation=nn.tanh,
+        )
+        self.rnn = ScannedRNN(
+            input_features=lstm_dim*2,
+            hidden_size=lstm_dim*2,
+            rngs=rngs,
+        )
+        self.actor = nnx.Linear(
+            in_features=lstm_dim*2,
+            out_features=action_dim,
+            kernel_init=orthogonal(0.01),
+            bias_init=constant(0.0),
+            rngs=rngs,
+        )
+        self.critic = nnx.Linear(
+            in_features=lstm_dim*2,
+            out_features=1,
+            kernel_init=orthogonal(1.0),
+            bias_init=constant(0.0),
+            rngs=rngs,
+        )
+        self.action_dim = action_dim
+        self.layer_norm = nnx.LayerNorm(lstm_dim,rngs=rngs)
+        self.rngs = rngs
+
+    def __call__(self, hidden, x1,x2):
+        embedding = nnx.vmap(self.cnn)(x1)
+
+        embedding = self.layer_norm(embedding)
+
+        embedding2 = nnx.vmap(self.cnn2)(x2)
+        embedding2 = self.layer_norm(embedding2)
+
+        rnn_in = jnp.concatenate([embedding, embedding2], axis=-1)
+        hidden, embedding = self.rnn(hidden, rnn_in)
+        embedding = nnx.tanh(embedding)
+
+        actor_mean = self.actor(embedding)
+
+        pi = distrax.Categorical(logits=actor_mean)
+
+        critic = self.critic(embedding)
+
+        return hidden, pi, jnp.squeeze(critic, axis=-1)
+
 
 
 class ActorRNN(nn.Module):

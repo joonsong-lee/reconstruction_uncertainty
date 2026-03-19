@@ -39,12 +39,12 @@ class rc_dataset(data.Dataset):
     
     def __getitem__(self, idx):
         try:
-            obs = np.memmap(os.path.join(self.data_dir,'obs',self.datas[idx]), mode='r',dtype = np.uint8, shape=(400,5,5,39))
-            global_ = np.memmap(os.path.join(self.data_dir,'global',self.datas[idx]), mode='r',dtype = np.uint8, shape=(400,5,8,41))
+            obs = np.memmap(os.path.join(self.data_dir,'obs',self.datas[idx]), mode='r',dtype = np.uint8, shape=(400,5,5,38))
+            global_ = np.memmap(os.path.join(self.data_dir,'global',self.datas[idx]), mode='r',dtype = np.uint8, shape=(400,5,11,40))
         except:
             temp = np.random.randint(len(self.datas))
-            obs = np.memmap(os.path.join(self.data_dir,'obs',self.datas[temp]), mode='r',dtype = np.uint8, shape=(400,5,5,39))
-            global_ = np.memmap(os.path.join(self.data_dir,'global',self.datas[temp]), mode='r',dtype = np.uint8, shape=(400,5,8,41))
+            obs = np.memmap(os.path.join(self.data_dir,'obs',self.datas[temp]), mode='r',dtype = np.uint8, shape=(400,5,5,38))
+            global_ = np.memmap(os.path.join(self.data_dir,'global',self.datas[temp]), mode='r',dtype = np.uint8, shape=(400,5,11,40))
             print(self.datas[idx])
         obs = np.array(obs).astype(np.float16)
         if self.task == 'regression':

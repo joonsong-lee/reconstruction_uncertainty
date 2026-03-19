@@ -1,156 +1,214 @@
 import math
-from dataclasses import dataclass
-from collections import OrderedDict
-
-from rotary_embedding_torch import RotaryEmbedding
-import torch
-import torch.nn as nn
-from torch.nn import functional as F
+import jax.numpy as jnp
+import jax
+import flax.nnx as nnx
+from typing import NamedTuple
 
 
-class LayerNorm(nn.Module):
-    """LayerNorm but with an optional bias. PyTorch doesn't support simply bias=False"""
+#from google deepmind' gemma https://github.com/google-deepmind/gemma/blob/main/gemma/gm/math/_positional_embeddings.py
+def apply_rope(
+    inputs: jax.Array,
+    positions: jax.Array,
+    *,
+    base_frequency: int = 10000,
+    scale_factor: float = 1.0,
+    rope_proportion: float = 1.0,
+) -> jax.Array:
+  """Applies RoPE.
 
-    def __init__(self, ndim, bias):
-        super().__init__()
-        self.weight = nn.Parameter(torch.ones(ndim))
-        self.bias = nn.Parameter(torch.zeros(ndim)) if bias else None
+  Let B denote batch size, L denote sequence length, N denote number of heads,
+  and H denote head dimension. Note that H must be divisible by 2.
 
-    def forward(self, input):
-        return F.layer_norm(input, self.weight.shape, self.weight, self.bias, 1e-5)
+  Args:
+    inputs: Array of shape [B, L, N, H].
+    positions:  Array of shape [B, L].
+    base_frequency: Base frequency used to compute rotations.
+    scale_factor: The scale factor used for positional interpolation, allowing
+      an expansion of sequence length beyond the pre-trained context length.
+    rope_proportion: The proportion of the head dimension to apply RoPE to.
 
+  Returns:
+    Array of shape [B, L, N, H].
+  """
+  head_dim = inputs.shape[-1]
+  rope_angles = int(rope_proportion * head_dim // 2)
+  nope_angles = head_dim // 2 - rope_angles
+  freq_exponents = (
+      (2.0 / head_dim) * jnp.arange(0, rope_angles, dtype=jnp.float32)
+  )
+  timescale = jnp.pad(
+      base_frequency**freq_exponents,
+      (0, nope_angles),
+      mode='constant',
+      constant_values=(0, jnp.inf),
+  )
 
-class CausalSelfAttention(nn.Module):
-    def __init__(self, config):
+  sinusoid_inp = (
+      positions[..., jnp.newaxis] / timescale[jnp.newaxis, jnp.newaxis, :]
+  )
+  sinusoid_inp = sinusoid_inp[..., jnp.newaxis, :]
+  if scale_factor < 1.0:
+    raise ValueError(f'scale_factor must be >= 1.0, got {scale_factor}')
+  sinusoid_inp /= scale_factor
+
+  sin = jnp.sin(sinusoid_inp)
+  cos = jnp.cos(sinusoid_inp)
+
+  first_half, second_half = jnp.split(inputs, 2, axis=-1)
+  first_part = first_half * cos - second_half * sin
+  second_part = second_half * cos + first_half * sin
+  out = jnp.concatenate([first_part, second_part], axis=-1)
+  return out.astype(inputs.dtype)
+
+class CausalSelfAttention(nnx.Module):
+    def __init__(self, config, rngs):
         super().__init__()
         assert config.n_embd % config.n_head == 0
         # key, query, value projections for all heads, but in a batch
-        self.c_attn = nn.Linear(config.n_embd, 3 * config.n_embd, bias=config.bias)
+        self.c_attn = nnx.Linear(in_features=config.n_embd, out_features=3 * config.n_embd, use_bias=config.bias, rngs=rngs)
         # output projection
-        self.c_proj = nn.Linear(config.n_embd, config.n_embd, bias=config.bias)
+        self.c_proj = nnx.Linear(in_features=config.n_embd, out_features=config.n_embd, use_bias=config.bias, rngs=rngs)
         # regularization
-        self.attn_dropout = nn.Dropout(config.dropout)
-        self.resid_dropout = nn.Dropout(config.dropout)
+        self.attn_dropout = nnx.Dropout(rate=config.dropout)
+        self.residual_dropout = nnx.Dropout(rate=config.dropout)
         self.n_head = config.n_head
         self.n_embd = config.n_embd
         self.dropout = config.dropout
-        # flash attention make GPU go brrrrr but support is only in PyTorch >= 2.0
-        self.flash = hasattr(torch.nn.functional, "scaled_dot_product_attention")
-        self.rope = RotaryEmbedding(config.n_embd // config.n_head, cache_max_seq_len = 400)
+        self.head_dim = config.n_embd // config.n_head
+        self.max_seq_len = config.frame_length
 
-    def forward(self, x,key_cache = None,value_cache = None):
-        (
-            B,
-            T,
-            C,
-        ) = x.size()  # batch size, sequence length, embedding dimensionality (n_embd)
-        # calculate query, key, values for all heads in batch and move head forward to be the batch dim
-        q, k1, v1 = self.c_attn(x).split(self.n_embd, dim=2)
-        if key_cache is not None :
-            key_cache[:,-T:] = k1
-            value_cache[:,-T:] = v1
-            k=key_cache
-            v = value_cache
-            true_T = k.size(1)
+    def __call__(self, x, kv_cache=None, cache_index=None):
+        """
+        Args:
+            x: input tensor (B, T, C)
+            kv_cache: tuple of (cached_k, cached_v) each with shape (B, max_seq_len, n_head, head_dim)
+                     or None if not using cache
+            cache_index: current position in cache (scalar int), required when using kv_cache
+        
+        Returns:
+            y: output tensor (B, T, C)
+            new_kv_cache: tuple of (new_k, new_v) for caching (same shape as input cache)
+        """
+        B, T, C = x.shape
+        
+        # Calculate query, key, values
+        q, k, v = jnp.split(self.c_attn(x), [self.n_embd, self.n_embd * 2], axis=-1)
+        k = k.reshape(B, T, self.n_head, self.head_dim)  # (B, T, nh, hs)
+        q = q.reshape(B, T, self.n_head, self.head_dim)  # (B, T, nh, hs)
+        v = v.reshape(B, T, self.n_head, self.head_dim)  # (B, T, nh, hs)
+        
+        # Compute positions for RoPE
+        if kv_cache is not None:
+            # Using cache: positions start from cache_index
+            # Use lax.iota instead of jnp.arange for JIT compatibility with traced values
+            positions = jax.lax.iota(jnp.int32, T) + cache_index
+            positions = jnp.broadcast_to(positions[jnp.newaxis, :], (B, T))
         else:
-            true_T = T
-            k = k1
-            v = v1
-        k = k.view(B, true_T, self.n_head, C // self.n_head).transpose(
-            1, 2
-        )  # (B, nh, T, hs)
-        q = q.view(B, T, self.n_head, C // self.n_head).transpose(1, 2)  # (B, nh, T, hs)
-
-        v = v.view(B, true_T, self.n_head, C // self.n_head).transpose(
-            1, 2
-        )  # (B, nh, T, hs)
-        if key_cache is not None :
-            q = self.rope.rotate_queries_or_keys(q,offset=true_T - T)
-            k = self.rope.rotate_queries_or_keys(k)
+            positions = jnp.broadcast_to(jnp.arange(T)[jnp.newaxis, :], (B, T))
+        
+        # Apply RoPE
+        q = apply_rope(q, positions)
+        k = apply_rope(k, positions)
+        
+        # Handle KV cache with fixed-size buffer and dynamic slicing
+        if kv_cache is not None:
+            cached_k, cached_v = kv_cache
+            max_seq_len = cached_k.shape[1]
+            
+            # Update cache at current position using dynamic_update_slice
+            # cached_k shape: (B, max_seq_len, n_head, head_dim)
+            # k shape: (B, T, n_head, head_dim)
+            new_cached_k = jax.lax.dynamic_update_slice(cached_k, k, (0, cache_index, 0, 0))
+            new_cached_v = jax.lax.dynamic_update_slice(cached_v, v, (0, cache_index, 0, 0))
+            
+            # Use full cache and apply attention mask to ignore invalid positions
+            k_for_attn = new_cached_k  # (B, max_seq_len, n_head, head_dim)
+            v_for_attn = new_cached_v  # (B, max_seq_len, n_head, head_dim)
+            
+            # Create mask: valid positions are [0, cache_index + T)
+            valid_len = cache_index + T
+            cache_positions = jax.lax.iota(jnp.int32, max_seq_len)  # [0, 1, 2, ..., max_seq_len-1]
+            # mask is True for invalid positions (to be masked out)
+            attn_mask = cache_positions[jnp.newaxis, :] >= valid_len  # (1, max_seq_len)
+            
+            new_kv_cache = (new_cached_k, new_cached_v)
         else:
-            q = self.rope.rotate_queries_or_keys(q)
-            k = self.rope.rotate_queries_or_keys(k)
-        # causal self-attention; Self-attend: (B, nh, T, hs) x (B, nh, hs, T) -> (B, nh, T, T)
-            # efficient attention using Flash Attention CUDA kernels
-        if key_cache is not None:
-            y = torch.nn.functional.scaled_dot_product_attention(
-                q,
-                k,
-                v,
-                attn_mask=None,
-                dropout_p=self.dropout if self.training else 0,
-                is_causal=False,)
-        else :
-            y = torch.nn.functional.scaled_dot_product_attention(
-            q,
-            k,
-            v,
-            attn_mask=None,
-            dropout_p=self.dropout if self.training else 0,
-            is_causal=True,
-        )
-        y = (
-            y.transpose(1, 2).contiguous().view(B, T, C)
-        )  # re-assemble all head outputs side by side
-        # output projection
-        y = self.resid_dropout(self.c_proj(y))
-        return y,k1,v1
+            k_for_attn = k
+            v_for_attn = v
+            new_kv_cache = None
+            attn_mask = None
+        
+        # Swap axes for attention: (B, T, nh, hs) -> (B, nh, T, hs)
+        q = q.swapaxes(1, 2)
+        k_attn = k_for_attn.swapaxes(1, 2)
+        v_attn = v_for_attn.swapaxes(1, 2)
+        
+        # Causal self-attention
+        if kv_cache is not None:
+            # With cache: use mask to ignore invalid (future) positions in cache
+            # attn_mask shape: (1, max_seq_len) -> expand to (B, 1, T, max_seq_len)
+            # True means "mask out" so we set those to -inf
+            mask = jnp.where(attn_mask[jnp.newaxis, :, jnp.newaxis, :], 
+                             jnp.finfo(q.dtype).min, 0.0)  # (1, 1, 1, max_seq_len)
+            # Manual attention since we need custom mask
+            scale = 1.0 / jnp.sqrt(self.head_dim)
+            attn_weights = jnp.einsum('bhqd,bhkd->bhqk', q, k_attn) * scale  # (B, nh, T, max_seq_len)
+            attn_weights = attn_weights + mask
+            attn_weights = jax.nn.softmax(attn_weights, axis=-1)
+            y = jnp.einsum('bhqk,bhkd->bhqd', attn_weights, v_attn)  # (B, nh, T, hs)
+        else:
+            # Without cache: use causal mask
+            y = jax.nn.dot_product_attention(q, k_attn, v_attn, is_causal=True)
+        y = y.swapaxes(1, 2).reshape(B, T, C)  # (B, T, C)
+        y = self.c_proj(y)
+
+        return y, new_kv_cache
 
 
 
-class MLP(nn.Module):
-    def __init__(self, config):
+class MLP(nnx.Module):
+    def __init__(self, config,rngs):
         super().__init__()
-        self.c_fc = nn.Linear(config.n_embd, 4 * config.n_embd, bias=config.bias)
-        self.gelu = nn.GELU()
-        self.c_proj = nn.Linear(4 * config.n_embd, config.n_embd, bias=config.bias)
-        self.dropout = nn.Dropout(config.dropout)
+        self.c_fc = nnx.Linear(in_features=config.n_embd, out_features=4 * config.n_embd, use_bias=config.bias,rngs=rngs)
+        self.c_proj = nnx.Linear(in_features=4 * config.n_embd, out_features=config.n_embd, use_bias=config.bias,rngs=rngs)
+        self.dropout = nnx.Dropout(rate=config.dropout)
 
-    def forward(self, x):
+    def __call__(self, x):
         x = self.c_fc(x)
-        x = self.gelu(x)
+        x = nnx.gelu(x)
         x = self.c_proj(x)
         x = self.dropout(x)
         return x
 
 
-class Block(nn.Module):
-    def __init__(self, config,kv_cache=False):
+class Block(nnx.Module):
+    def __init__(self, config, rngs):
         super().__init__()
-        self.ln_1 = LayerNorm(config.n_embd, bias=config.bias)
-        self.attn = CausalSelfAttention(config)
-        self.ln_2 = LayerNorm(config.n_embd, bias=config.bias)
-        self.mlp = MLP(config)
+        self.ln_1 = nnx.LayerNorm(config.n_embd, epsilon=1e-5, use_fast_variance=False, rngs=rngs)
+        self.attn = CausalSelfAttention(config, rngs=rngs)
+        self.ln_2 = nnx.LayerNorm(config.n_embd, epsilon=1e-5, use_fast_variance=False, rngs=rngs)
+        self.mlp = MLP(config, rngs=rngs)
         self.config = config
-        self.kv_cache = kv_cache
-        if kv_cache:
-            self.keys=torch.zeros((config.batch_size,config.frame_length,config.n_embd))
-            self.values=torch.zeros((config.batch_size,config.frame_length,config.n_embd))
-            self.cnt = 0
 
-    def forward(self, x):
-        if self.kv_cache and self.cnt!=0 and not self.training : #when using kv cache and not the first step
-            y,k,v = self.attn(self.ln_1(x),self.keys[:,:self.cnt+x.shape[1]],self.values[:,:self.cnt+x.shape[1]])
-            self.keys[:,self.cnt:self.cnt+x.shape[1]] = k
-            self.values[:,self.cnt:self.cnt+x.shape[1]] = v
-            self.cnt+=x.shape[1]
-        elif self.kv_cache and self.cnt==0 and not self.training: #when it is first step
-            y,k,v = self.attn(self.ln_1(x))
-            shape = x.shape[1]
-            self.keys[:,:shape] = k
-            self.values[:,:shape] = v
-            self.keys = self.keys.to(x.device)
-            self.values = self.values.to(x.device)
-            self.cnt = shape
-        else :
-            y,_,_ = self.attn(self.ln_1(x))
-        x= x+y
+    def __call__(self, x, kv_cache=None, cache_index=None):
+        """
+        Args:
+            x: input tensor (B, T, C)
+            kv_cache: KV cache for this block or None
+            cache_index: current position in cache (scalar int)
+        
+        Returns:
+            x: output tensor (B, T, C)
+            new_kv_cache: updated KV cache
+        """
+        attn_out, new_kv_cache = self.attn(self.ln_1(x), kv_cache=kv_cache, cache_index=cache_index)
+        x = x + attn_out
         x = x + self.mlp(self.ln_2(x))
-        return x
+        return x, new_kv_cache
 
 
-@dataclass
-class GPTConfig:
+
+class GPTConfig(NamedTuple):
     frame_length: int
     n_layer: int
     n_head: int
@@ -161,74 +219,76 @@ class GPTConfig:
     batch_size:int
 
 
-class GPT(nn.Module):
-    def __init__(self, config,is_kv=False):
+class GPT(nnx.Module):
+    def __init__(self, config, rng, is_kv=False):
         super().__init__()
         self.config = config
-        self.in_proj = nn.Linear(config.input_size, config.n_embd)
-        self.transformer = nn.ModuleDict(
-            dict(
-                #wte_u = nn.Embedding(config.action_size, config.n_embd),
-                drop=nn.Dropout(config.dropout),
-                h=nn.ModuleList([Block(config,is_kv) for _ in range(config.n_layer)]),
-                ln_f=LayerNorm(config.n_embd, bias=config.bias),
-            )
-        )
-        # init all weights
-        self.apply(self._init_weights)
-        # apply special scaled init to the residual projections, per GPT-2 paper
-        for pn, p in self.named_parameters():
-            if pn.endswith("c_proj.weight"):
-                torch.nn.init.normal_(
-                    p, mean=0.0, std=0.02 / math.sqrt(2 * config.n_layer)
-                )
+        self.in_proj = nnx.Linear(config.input_size, config.n_embd, rngs=rng)
+        self.drop = nnx.Dropout(rate=config.dropout, rngs=rng)
+        self.ln_f = nnx.LayerNorm(config.n_embd, epsilon=1e-5, use_fast_variance=False, rngs=rng)
+        
+        # Create blocks using nnx.List for Flax NNX 0.12.0+ compatibility
+        blocks_list = []
+        for i in range(config.n_layer):
+            layer_rng = nnx.Rngs(jax.random.fold_in(rng.default.key.value, i))
+            blocks_list.append(Block(config, rngs=layer_rng))
+        self.blocks = nnx.List(blocks_list)
+        
+        self.num_layers = config.n_layer
         self.is_kv = is_kv
+        self.head_dim = config.n_embd // config.n_head
+        self.n_head = config.n_head
+        self.max_seq_len = config.frame_length
 
-    def _init_weights(self, module):
-        if isinstance(module, nn.Linear):
-            torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
-            if module.bias is not None:
-                torch.nn.init.zeros_(module.bias)
-        elif isinstance(module, nn.Embedding):
-            torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
-
-    def compute_context_vector(self, X): 
-        device = X.device
-        b, t, n_embd = X.size()
-        # forward the GPT model itself
-        # from: https://stackoverflow.com/questions/61026393/pytorch-concatenate-rows-in-alternate-order
-        x = self.transformer.drop(X )
-        for block in self.transformer.h:
-            x = block(x)
-        x = self.transformer.ln_f(x)
-        return x
+    def init_kv_cache(self, batch_size):
+        """Initialize fixed-size KV cache for all layers.
+        
+        Args:
+            batch_size: batch size for the cache
+        
+        Returns:
+            List of (k_cache, v_cache) tuples for each layer,
+            each with shape (batch_size, max_seq_len, n_head, head_dim)
+        """
+        cache = []
+        for _ in range(self.num_layers):
+            k_cache = jnp.zeros((batch_size, self.max_seq_len, self.n_head, self.head_dim))
+            v_cache = jnp.zeros((batch_size, self.max_seq_len, self.n_head, self.head_dim))
+            cache.append((k_cache, v_cache))
+        return cache
     
-    def reset_cache_with_burnin(self,X):
-        assert self.transformer.h[0].kv_cache==True, "kv cache should be enabled to use this function"
-        for block in self.transformer.h:
-            block.cnt = 0 #all the block contatins its own step count, reset it to 0
-        context = self.compute_context_vector(X) #kv will be automatically updated in each block
-        return context
-
-    def reset_cache_without_burnin(self):
-        for block in self.transformer.h:
-            block.cnt = 0
-
-    def compute_context_vector_with_cache(self, X): 
-        assert self.transformer.h[0].kv_cache==True, "kv cache should be enabled to use this function"
-        x1= X.unsqueeze(1) if len(X.shape)==2 else X  # (B,1,n_embd)
-        device = X.device
-        x1 = self.transformer.drop(x1 )
-        for block in self.transformer.h:
-            x1 = block(x1)
-        x1 = self.transformer.ln_f(x1)
-        return x1
-
-    def forward(self, X):
+    def __call__(self, X, kv_cache=None, cache_index=None):
+        """
+        Forward pass with optional KV cache support.
+        
+        Args:
+            X: input tensor (B, T, input_size)
+            kv_cache: List of (k_cache, v_cache) for each layer, or None for no caching
+                     Each cache has shape (B, max_seq_len, n_head, head_dim)
+            cache_index: current position in cache (scalar int), required when using kv_cache
+        
+        Returns:
+            output: transformed tensor (B, T, n_embd)
+            new_kv_cache: updated KV cache list (only returned if kv_cache is not None)
+        """
         X = self.in_proj(X)
-        if self.is_kv and not self.training:
-            x = self.compute_context_vector_with_cache(X)
+        X = self.drop(X)
+        
+        if kv_cache is not None:
+            # Use KV cache - process each block sequentially
+            new_kv_cache = []
+            for i, block in enumerate(self.blocks):
+                layer_cache = kv_cache[i]
+                X, layer_new_cache = block(X, kv_cache=layer_cache, cache_index=cache_index)
+                new_kv_cache.append(layer_new_cache)
+            
+            X = self.ln_f(X)
+            return X, new_kv_cache
         else:
-            x = self.compute_context_vector(X) # reward (when including reward in context)
-        return x
+            # No KV cache - standard forward pass
+            for block in self.blocks:
+                X, _ = block(X, kv_cache=None, cache_index=None)
+            
+            X = self.ln_f(X)
+            return X
  
